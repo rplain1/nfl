@@ -1,0 +1,19 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r}
+library(tidyverse)
+library(duckdb)
+```
+
+
+```{r}
+conn <- DBI::dbConnect(duckdb::duckdb(), 'data/football.duckdb')
+
+pbp <- tbl(conn, "BASE.NFLFASTR_PBP")
+
+pbp
+```
