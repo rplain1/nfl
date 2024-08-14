@@ -17,3 +17,377 @@ pbp <- tbl(conn, "BASE.NFLFASTR_PBP")
 
 pbp
 ```
+
+
+```{r}
+
+
+df_snaps <- map(2012:2023, ~nflreadr::load_snap_counts(.x)) |>
+    bind_rows()
+
+
+```
+
+
+
+```{r}
+library(httr)
+library(jsonlite)
+
+get_ffc_adp <- function(format, year, teams = "12", position = "all") {
+  url <- glue::glue("https://fantasyfootballcalculator.com/api/v1/adp/{format}?teams={teams}&year={year}&position={position}")
+  if(year == 2023) {
+    url <- 'https://fantasyfootballcalculator.com/adp/ppr/12-team/all/2023'
+  }
+  # Fetch the data from the URL
+  response <- GET(url)
+
+  # Check if the request was successful
+  if (status_code(response) == 200) {
+    # Parse the JSON content
+    data <- content(response, as = "text")
+    json_data <- fromJSON(data, flatten = TRUE)
+  } else {
+    cat("Error: ", status_code(response), "\n")
+  }
+
+  json_data$players |>
+    as_tibble() |>
+    mutate(season = year)
+
+}
+
+map(2014:2023, ~get_ffc_adp(format = 'ppr', year =  .x)) |>
+    bind_rows() -> df_adp_ppr
+
+```
+
+
+```{r}
+ff_ids <- nflreadr::load_ff_playerids()
+
+ff_ids <- ff_ids |> filter(is.na(
+  case_when(
+    merge_name == "mike williams" & gsis_id == "00-0033536" ~ TRUE,
+    merge_name == "steve smith" & gsis_id == "00-0020337" ~ TRUE,
+    merge_name == "zach miller" & gsis_id == "00-0027125" ~ TRUE,
+    TRUE ~ NA)
+  )
+)
+```
+
+```{r}
+player_stats <- nflreadr::load_player_stats(seasons = 2012:2023, stat_type = c('offense'))
+
+```
+
+
+```{r}
+df_adp_ppr$join_name <- nflreadr::clean_player_names(df_adp_ppr$name)
+df_adp_ppr <- df_adp_ppr |>
+  mutate(
+    join_name = case_when(
+      join_name == "Mike Vick" ~ "Michael Vick",
+      str_detect(join_name, "Jr") ~ str_remove(join_name, " Jr"),
+      TRUE ~ join_name
+    ),
+    join_name = str_to_lower(join_name)
+  ) |>
+  inner_join(ff_ids |>
+    select(gsis_id, merge_name, sleeper_id, position, pfr_id) |>
+    filter(!is.na(gsis_id)), by = c("join_name" = "merge_name", "position" = "position")) |>
+    group_by(season, position) |>
+    arrange(adp) |>
+    mutate(pos_rank = row_number()) |>
+    ungroup()
+
+
+df_snaps
+df_adp_snaps <- df_adp_ppr |>
+  left_join(df_snaps |> select(-position, - team),
+    by = c("pfr_id" = "pfr_player_id", 'season')
+  )
+
+```
+
+
+```{r}
+df_base <- df_adp_snaps |> 
+  left_join(
+    player_stats |> 
+      select(player_id, week, season, fantasy_points_ppr),
+    by = c('gsis_id' = 'player_id', 'season' = 'season', 'week')
+  )
+```
+
+
+
+
+```{r}
+df_playing_time_agg <- df_base |>
+  filter(position %in% c("QB", "WR", "TE", "RB")) |>
+  ungroup() |>
+  filter(
+    case_when(
+      position %in% c("QB", "TE") & pos_rank <= 10 ~ TRUE,
+      position %in% c("RB", "WR") & pos_rank <= 25 ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    week <= 13,
+    game_type == "REG"
+  ) |>
+  group_by(season, team) |>
+  mutate(team_games = n_distinct(game_id)) |>
+  ungroup() |>
+  group_by(name, position, pfr_id, season) |>
+  summarise(
+    n_games = n_distinct(game_id),
+    team_games = max(team_games),
+    n_games_perc = n_games / team_games,
+    across(offense_pct, list(mean = mean, median = median, min = min)),
+    injured_in_game = n_distinct(if_else(offense_pct <= 0.25, game_id, NA), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+df_injury <- df_playing_time_agg |>
+  mutate(
+    injured_games = (team_games - n_games) + (injured_in_game),
+    injury_rate = (injured_games / team_games),
+    availability_rate = (1 - injury_rate)
+  ) |>
+  filter(injury_rate < 1)
+
+
+
+library(brms)
+library(tidybayes)
+
+model <- brm(
+  bf(
+    injury_rate ~ 1 + (1 | position),
+    zi ~ 1
+  ),
+  data = df_injury,
+  prior = c(
+    prior(normal(0, 3), class = "Intercept"),
+    prior(gamma(2, 1), class = "phi"),
+    # Prior for the zero-inflation component
+    prior(normal(-2, 2), class = "Intercept", dpar = "zi"),
+
+    # Prior for the random effects
+    prior(cauchy(0, 0.5), lb = 0, class = "sd")
+  ),
+  family = zero_inflated_beta(),
+  chains = 4,
+  iter = 10000,
+  warmup = 7000,
+  cores = 4,
+  seed = 1234,
+  control = list(adapt_delta = 0.95)
+)
+
+pairs(model)
+plot(model)
+pp_check(model)
+
+
+positions <- c("QB", "RB", "WR", "TE")
+new_data <- data.frame(position = positions)
+simulations <- posterior_predict(model, newdata = new_data, ndraws = 10000)
+
+play_rates <- tibble(
+  position = rep(new_data$position, each = 10000),
+  injury_rate = as.vector(simulations)
+) |> 
+  mutate(
+    play = rbinom(n(), 1, 1 - injury_rate)
+  ) |> 
+  group_by(position) |> 
+  summarise(
+    mean_play = mean(play),
+    play = list(play)
+  )
+
+
+# Now I can feed this into the adp model
+df_input <- df_base |> 
+  filter(week < 4, fantasy_points_ppr >= 0) |> 
+  mutate(draft_round = ceiling(adp / 10) * 1) |> 
+  filter(draft_round <= 16)
+
+points_model <- brm(
+  fantasy_points_ppr ~ 1 + adp + (1 | position), 
+  data = df_input,
+  family = skew_normal(),
+  prior = c(
+    prior(normal(10, 5), class = Intercept, lb = 0),
+    prior(exponential(1), class = 'sd', group = 'position'),
+    prior(normal(0, 5), class = 'b', coef = "adp")
+  ),
+  warmup = 7000,
+  iter = 10000,
+  cores = 4, 
+  chains = 4,
+  control = list(adapt_delta = 0.95),  # Increase adaptation
+  seed = 123
+)
+
+plot(points_model)
+
+pp_check(points_model)
+
+```
+
+For some unknown reason, the data is not available for 2023
+
+```{r}
+
+df <- read_csv('~/Downloads/adp-every-season - Sheet1.csv') |> 
+  janitor::clean_names()
+
+
+ff_ids <- nflreadr::load_ff_playerids()
+df$join_name <- nflreadr::clean_player_names(df$name)
+
+df_adp <- df |> 
+  filter(!is.na(name)) |> 
+  filter(! pos %in% c('DST', 'K')) |> 
+  filter(between(season, 2013, 2023)) |> 
+  mutate(
+    join_name = case_when(
+      join_name == 'Mike Vick' ~ 'Michael Vick',
+      str_detect(join_name, 'Jr') ~ str_remove(join_name, ' Jr'),
+      TRUE ~ join_name
+    ),
+    join_name = str_to_lower(join_name)
+  ) |> 
+  inner_join(ff_ids |> 
+               filter(!is.na(gsis_id)), by = c('join_name' = 'merge_name', 'pos' = 'position')) 
+
+df_adp <- df_adp |> group_by(season, pos) |> arrange(overall) |> mutate(pos_rank = row_number()) |> ungroup()
+
+player_stats <- nflreadr::load_player_stats(seasons = 2013:2023, stat_type = c('offense'))
+
+df_adp |> 
+  summarise(n_distinct(gsis_id))
+
+df_final <- df_adp |> 
+  inner_join(player_stats, by = c('gsis_id' = 'player_id', 'season' = 'season')) |> 
+  mutate(
+    ff_points = (
+      (passing_yards * 0.04) + (passing_tds * 4) + (interceptions * - 1) + (sack_fumbles_lost * -2) +
+        (rushing_yards * 0.1) + (rushing_tds * 6) + (rushing_fumbles_lost * -2) +
+        (receiving_yards * 0.1) + (receiving_tds * 6) + (receiving_fumbles_lost * -2) + (receptions)
+    )
+  ) |> 
+  select(name = name.x, pos, overall, season, ff_points, gsis_id, week, pos_rank, age, draft_year) |> 
+  group_by(gsis_id) |> mutate(experience = season - draft_year) |> ungroup()
+
+
+```
+
+
+```{r}
+my_league <- ffscrapr::ff_connect('sleeper', '996102938634387456', season = 2023) # hot boyz
+my_league
+
+my_league2 <- ffscrapr::ff_connect('sleeper', '956624612056481792', season = 2023) # unbound keeper
+my_league2
+draftpicks <- ffscrapr::ff_draft(my_league2)
+draftpicks
+
+
+actual_data <- draftpicks |> 
+  left_join(ff_ids |> select(sleeper_id, gsis_id), by = c('player_id' = 'sleeper_id')) |> 
+  left_join(df_adp |> 
+              filter(season == 2023) |> 
+              select(overall, gsis_id), by = c('gsis_id')) |>
+  group_by(franchise_id, pos) |> 
+  arrange(overall) |> 
+  mutate(rn = row_number()) |> 
+  filter(
+    (pos == 'QB' & rn == 1) |
+    (pos == 'WR' & rn <= 3) |
+    (pos == 'RB' & rn <= 3) | 
+    (pos == 'TE' & rn <= 1) 
+  ) |> 
+  select(franchise_id, franchise_name, player_name, adp = overall, position = pos)
+
+
+simulations <- posterior_predict(points_model, newdata = actual_data, ndraws = 10000)
+
+predictions <- simulations |> 
+  t() |> 
+  as_tibble() |> 
+  bind_cols(actual_data) |> 
+  pivot_longer(starts_with('V')) 
+
+
+predictions |> 
+  group_by(franchise_id,franchise_name, position, player_name) |> 
+  summarise(value = list(value), .groups = 'drop') |> 
+  left_join(play_rates) |> 
+  mutate(
+    rn = list(1:1e4)
+  ) |> 
+  unnest(cols = c(value, rn, play)) |> 
+  group_by(franchise_id, franchise_name, rn) |> 
+  summarise(ff_points = sum(value * play), .groups = 'drop') |> 
+  mutate(ff_points = ff_points + rgamma(1e4, 5, 0.5)) -> simulated_games
+
+simulated_games |> 
+  ggplot(aes(ff_points, reorder(franchise_name, ff_points)))  + 
+  stat_halfeye(aes(fill = franchise_name)) +
+  theme(legend.position = 'none') +
+  labs(
+    x = 'Points',
+    y = NULL
+  )
+  ggridges::geom_density_ridges() 
+  
+  
+
+```
+
+
+```{r}
+fantasy_schedule <- ffscrapr::ff_schedule(my_league2)
+fantasy_schedule |> 
+  filter(week <= 4) |> 
+  group_by(franchise_id) |> 
+  summarise(wins = sum(result == 'W'), pf = sum(franchise_score)) |> 
+  arrange(-pf) |> 
+  left_join(ffscrapr::ff_franchises(my_league2))
+
+
+
+sim_games_nest <- simulated_games |> 
+  summarise(ff_points = list(ff_points), .by = franchise_id)
+
+fantasy_schedule_sim <- fantasy_schedule |> 
+  left_join(sim_games_nest) 
+
+franchises = ffscrapr::ff_franchises(my_league2)
+
+fantasy_schedule_sim  |> 
+  filter(week <= 13) |> 
+  left_join(fantasy_schedule_sim, by = c('opponent_id' = 'franchise_id', 'week')) |> 
+  mutate(
+    win = map2_dbl(.x = ff_points.x, .y = ff_points.y, ~ sum(.x > .y)/10000)
+  ) |> 
+  select(franchise_id, opponent_id, week, win) |> 
+  left_join(franchises) |> 
+  mutate(win = paste0(round(win * 100, 0), "%")) |> 
+  pivot_wider(
+    id_cols = franchise_name, names_from = week, values_from = win
+  )
+
+```
+
+
+
+```{r}
+N <- 100
+rbinom(10, 1, 0.36)
+```
